@@ -7,3 +7,5 @@ seaborn
 matplotlib
 pandas
 openpyxl
+psutil
+llama-cpp-python

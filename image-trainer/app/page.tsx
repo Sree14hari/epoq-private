@@ -11,8 +11,10 @@ import { FolderOpen, Play, Square, Save, Activity, Terminal, CheckCircle, AlertC
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { save } from '@tauri-apps/plugin-dialog';
-import { writeTextFile } from '@tauri-apps/plugin-fs';
+import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs';
 import QRCodeConnect from './components/QRCodeConnect';
+import CoPilotSidebar from './components/CoPilotSidebar';
+import LlmEventBridge, { type LlmInsight } from './components/LlmEventBridge';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -146,6 +148,9 @@ export default function Home() {
   // Dataset Analysis State
   const [datasetStats, setDatasetStats] = useState<any | null>(null);
   const [analyzingDataset, setAnalyzingDataset] = useState(false);
+
+  // LLM Co-Pilot state
+  const [latestInsight, setLatestInsight] = useState<LlmInsight | null>(null);
   // Check GPU availability
   useEffect(() => {
     async function checkGpu() {
@@ -640,6 +645,13 @@ useEffect(() => {
             const prog = (data.epoch / data.total_epochs) * 100;
             setProgress(prog);
             if (activeTab === 'logs' && data.epoch === 1) setActiveTab('charts');
+
+            // Feed real-time metrics to the LLM aggregator
+            invoke('update_training_metrics', {
+              epoch: data.epoch,
+              loss: parseFloat(data.train_loss),
+              accuracy: parseFloat(data.train_accuracy),
+            }).catch(console.error);
           } 
           else if (data.status === 'checkpoint') {
             addLog(`Checkpoint saved: ${data.message} at ${data.path}`, 'success');
@@ -845,6 +857,158 @@ const startAutoML = async () => {
   } catch (err) {
     console.error("EXPORT ERROR:", err);
     addLog(`Export failed: ${err}`, "error");
+  }
+};
+
+const exportAsIpynb = async () => {
+  try {
+    console.log("Export Notebook triggered");
+
+    if (!chartData.length) {
+      addLog("No training data to export.", "error");
+      return;
+    }
+
+    const nbMeta = {
+      kernelspec: { display_name: "Python 3", language: "python", name: "python3" },
+      language_info: {
+        codemirror_mode: { name: "ipython", version: 3 },
+        file_extension: ".py",
+        mimetype: "text/x-python",
+        name: "python",
+        nbconvert_exporter: "python",
+        pygments_lexer: "ipython3",
+        version: "3.8.0"
+      }
+    };
+
+    const cells = [
+      {
+        cell_type: "markdown",
+        metadata: {},
+        source: [
+          "# EPOQ AI Training Export\n",
+          `**Model:** ${model}\n\n`,
+          `**Dataset Path:** \`${datasetPath}\`\n\n`,
+          `**Epochs:** ${epochs} | **Batch Size:** ${batchSize} | **Learning Rate:** ${learningRate}\n\n`,
+          `**Elapsed Time:** ${formatTime(elapsedSeconds)}\n`
+        ]
+      },
+      {
+        cell_type: "code",
+        execution_count: 1,
+        metadata: {},
+        outputs: [],
+        source: [
+          "import matplotlib.pyplot as plt\n",
+          "import pandas as pd\n",
+          "\n",
+          "# Recreate training charts\n",
+          `chart_data = ${JSON.stringify(chartData, null, 2)}\n`,
+          "df = pd.DataFrame(chart_data)\n",
+          "\n",
+          "fig, ax1 = plt.subplots()\n",
+          "ax1.set_xlabel('Epoch')\n",
+          "ax1.set_ylabel('Accuracy', color='tab:blue')\n",
+          "ax1.plot(df['epoch'], df['accuracy'], label='Train Accuracy', color='tab:blue')\n",
+          "if 'val_accuracy' in df.columns:\n",
+          "    ax1.plot(df['epoch'], df['val_accuracy'], label='Val Accuracy', color='tab:cyan', linestyle='--')\n",
+          "ax1.tick_params(axis='y', labelcolor='tab:blue')\n",
+          "ax1.legend(loc='upper left')\n",
+          "\n",
+          "ax2 = ax1.twinx()\n",
+          "ax2.set_ylabel('Loss', color='tab:red')\n",
+          "ax2.plot(df['epoch'], df['loss'], label='Train Loss', color='tab:red')\n",
+          "if 'val_loss' in df.columns:\n",
+          "    ax2.plot(df['epoch'], df['val_loss'], label='Val Loss', color='tab:orange', linestyle='--')\n",
+          "ax2.tick_params(axis='y', labelcolor='tab:red')\n",
+          "ax2.legend(loc='upper right')\n",
+          "\n",
+          "plt.title('Training Metrics')\n",
+          "plt.show()\n"
+        ]
+      }
+    ];
+
+    if (evalResult) {
+      cells.push({
+        cell_type: "markdown",
+        metadata: {},
+        source: [
+          "## Evaluation Results\n",
+          "```json\n",
+          JSON.stringify(evalResult.report, null, 2),
+          "\n```\n"
+        ]
+      });
+    }
+
+    try {
+      const scriptPath = await resolveResource('python_backend/script.py');
+      const modelFactoryPath = await resolveResource('python_backend/model_factory.py');
+      const augmentationPath = await resolveResource('python_backend/augmentation_builder.py');
+
+      if (scriptPath && modelFactoryPath && augmentationPath) {
+        cells.push({
+          cell_type: "markdown",
+          metadata: {},
+          source: ["## Backend Training Source Code\nThe exact Python code used by the PyTorch backend to run this training session."]
+        });
+
+        const augmentationCode = await readTextFile(augmentationPath);
+        cells.push({
+          cell_type: "code",
+          execution_count: null,
+          metadata: { title: "augmentation_builder.py" },
+          outputs: [],
+          source: augmentationCode.split('\n').map(line => line + '\n')
+        });
+
+        const modelFactoryCode = await readTextFile(modelFactoryPath);
+        cells.push({
+          cell_type: "code",
+          execution_count: null,
+          metadata: { title: "model_factory.py" },
+          outputs: [],
+          source: modelFactoryCode.split('\n').map(line => line + '\n')
+        });
+
+        const scriptCode = await readTextFile(scriptPath);
+        cells.push({
+          cell_type: "code",
+          execution_count: null,
+          metadata: { title: "script.py" },
+          outputs: [],
+          source: scriptCode.split('\n').map(line => line + '\n')
+        });
+      }
+    } catch (codeErr) {
+      console.error("Failed to inject source code", codeErr);
+      addLog("Could not include source code in the notebook.", "info");
+    }
+
+    const payload = {
+      cells,
+      metadata: nbMeta,
+      nbformat: 4,
+      nbformat_minor: 4
+    };
+
+    const filePath = await save({
+      filters: [{ name: "Jupyter Notebook", extensions: ["ipynb"] }]
+    });
+
+    if (!filePath) {
+      addLog("Notebook export cancelled.", "info");
+      return;
+    }
+
+    await writeTextFile(filePath, JSON.stringify(payload, null, 2));
+    addLog("Notebook exported successfully.", "success");
+
+  } catch (err) {
+    console.error("EXPORT ERROR:", err);
+    addLog(`Notebook export failed: ${err}`, "error");
   }
 };
 const fetchSystemInfo = async (initial = false) => {
@@ -1774,13 +1938,22 @@ useEffect(() => {
    </div>
 
    {!isRunning && chartData.length > 0 && (
-     <button
-       onClick={exportAsJson}
-       className="mt-3 flex items-center gap-2 px-4 py-2 bg-white text-black hover:bg-zinc-200 text-xs font-semibold rounded-full transition-all shadow"
-     >
-       <Download className="w-3 h-3" />
-       Export JSON
-     </button>
+     <div className="mt-3 flex gap-2">
+       <button
+         onClick={exportAsJson}
+         className="flex items-center gap-2 px-4 py-2 bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white text-xs font-semibold rounded-full transition-all shadow"
+       >
+         <Download className="w-3 h-3" />
+         JSON
+       </button>
+       <button
+         onClick={exportAsIpynb}
+         className="flex items-center gap-2 px-4 py-2 bg-white text-black hover:bg-zinc-200 text-xs font-semibold rounded-full transition-all shadow"
+       >
+         <Download className="w-3 h-3" />
+         Notebook (.ipynb)
+       </button>
+     </div>
    )}</div> 
                 </div>
                 <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
@@ -2590,6 +2763,9 @@ useEffect(() => {
 
 
     </div>
+    {/* LLM Co-Pilot — event bridge (invisible) + sidebar UI */}
+    <LlmEventBridge onInsight={(insight) => setLatestInsight({ ...insight })} />
+    <CoPilotSidebar latestInsight={latestInsight} selectedEnv={selectedEnv} />
     </>
   );
 }
